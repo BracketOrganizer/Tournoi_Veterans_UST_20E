@@ -60,6 +60,13 @@ let USER_ROLE    = null;
 let MANAGER_TEAM_ID = null; // équipe assignée si USER_ROLE === 'manager'
 let unsubTournament = null;
 let unsubRoster = null;
+let tvCycleIv = null;   // minuteur d'avancement entre écrans (mode Écran)
+let tvClockIv = null;   // intervalle de mise à jour de l'horloge en mode Écran
+let tvScrollIv = null;  // intervalle du défilement automatique en mode Écran
+let tvScreenIndex = 0;  // index de l'écran actuellement affiché parmi les écrans disponibles (mode Écran)
+let tvLastPhase = null; // dernière phase connue, pour repartir au 1er écran si poules→phase 2
+let tvLastScreensSig = null; // signature de la dernière liste d'écrans actifs, pour détecter un changement d'étape et repartir au début
+let tvLastRenderedKey = null; // clé du dernier écran réellement affiché, pour distinguer un changement d'écran d'une simple actualisation de données
 
 const ST = {
   page:1, prevPage:1, rulesOpen:false,
@@ -374,6 +381,7 @@ function refreshCurrentPage(){
   if(ST.page===5) renderFinalPage();
   if(ST.page==='T') renderTeamsSpecPage();
   if(ST.page==='M') renderManagerPage();
+  if(ST.page==='TV') renderTVContent();
 }
 
 
@@ -1046,6 +1054,8 @@ window.goTo = function(n){
     return;
   }
   ST.prevPage=ST.page; ST.page=n;
+  stopTVCycle(); // coupe l'horloge/avancement du mode Écran si on le quitte
+  document.body.classList.toggle('tv-mode', n==='TV'); // masque l'entête normale en mode Écran
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   if(n==='T'){
     document.getElementById('pageT').classList.add('active');
@@ -1060,6 +1070,16 @@ window.goTo = function(n){
     document.getElementById('pageM').classList.add('active');
     renderManagerPage();
     ST.page='M';
+    return;
+  }
+  if(n==='TV'){
+    document.getElementById('pageTV').classList.add('active');
+    renderTVPage();
+    startTVCycle();
+    document.querySelectorAll('.spec-nav-btn').forEach(btn=>{
+      btn.classList.toggle('spec-nav-active', btn.dataset.target==='TV');
+    });
+    ST.page='TV';
     return;
   }
   document.getElementById('page'+n).classList.add('active');
@@ -1314,7 +1334,7 @@ window.closeMobileMenu = function(){
   document.getElementById('menuOverlay').classList.remove('open');
 };
 function syncDrawerButtons(){
-  [['liveBtn','drawerLiveBtn'],['adminBtn','drawerAdminBtn'],['managerBtn','drawerManagerBtn'],['backBtn','drawerBackBtn'],['fwdBtn','drawerFwdBtn'],['logoutBtn','drawerLogoutBtn']].forEach(([deskId,drawId])=>{
+  [['liveBtn','drawerLiveBtn'],['tvBtn','drawerTvBtn'],['adminBtn','drawerAdminBtn'],['managerBtn','drawerManagerBtn'],['backBtn','drawerBackBtn'],['fwdBtn','drawerFwdBtn'],['logoutBtn','drawerLogoutBtn']].forEach(([deskId,drawId])=>{
     const desk=document.getElementById(deskId); const draw=document.getElementById(drawId);
     if(desk&&draw) draw.style.display=desk.style.display==='none'?'none':'';
   });
@@ -1849,8 +1869,22 @@ function rankRowColor(rank){
   if(rank<=4) return 'rgba(217,180,43,.10)';
   return 'rgba(217,90,43,.10)';
 }
+// Désactive et étiquette le bouton "Composer les tableaux" tant qu'il reste
+// des matchs de poules sans résultat — évite à l'admin de cliquer pour se
+// heurter au blocage dans buildGroups().
+function updateBuildGroupsBtn(){
+  const btn = document.getElementById('buildGroupsBtn'); if(!btn) return;
+  const missing = ['A','B','C','D'].reduce((sum,p)=>{
+    const matches = ST.poolSchedule.filter(m=>m.pool===p);
+    return sum + matches.filter(m=>{ const r=getPoolResult(m.matchId); return !(r.ga!==''&&r.gb!=='') ; }).length;
+  }, 0);
+  btn.disabled = missing>0;
+  btn.title = missing>0 ? `${missing} match${missing>1?'s':''} de poule restant${missing>1?'s':''} avant de pouvoir composer les tableaux` : 'Toutes les poules sont terminées';
+  btn.textContent = missing>0 ? `🔒 Phase 2 (${missing} match${missing>1?'s':''} restant${missing>1?'s':''})` : '2️⃣ Composer les tableaux (Phase 2)';
+}
 function renderPoolStandingsPanel(){
   const el=document.getElementById('poolStandingsPanel'); if(!el) return;
+  updateBuildGroupsBtn();
   el.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:10px">` +
     ['A','B','C','D'].map(p=>{
       const st=computePoolStandings(p);
@@ -2005,6 +2039,357 @@ function renderGroupStandingsPanel(){
         </table>` : `<div style="font-size:11px;color:var(--muted)">Résultats en attente (demi-finales puis finale/petite finale).</div>`}
       </div>`;
     }).join('') + `</div>`;
+}
+
+// ══════════════════════════════════════════════════════════
+// MODE ÉCRAN — diffusion sur un écran externe (TV via un ordinateur)
+// Page plein écran, fond sombre, gros caractères, pensée pour être vue de
+// loin. Se met à jour automatiquement (mêmes données Firestore live que le
+// reste de l'appli — pas de logique réseau séparée). Réglages (quoi
+// afficher, vitesse d'alternance, barre visible ou non) mémorisés dans le
+// navigateur de CET ordinateur (localStorage).
+//
+// Phase 1 (poules) : comme dans les autres tournois — tous les matchs de
+// poules sur un seul écran qui défile, en alternance avec le classement des
+// poules.
+// Phase 2 (5 tableaux à élimination) : contrairement aux tournois à bracket
+// classique (Tour 1 / Tour 2 / Tour Classement), ici les 5 tableaux jouent
+// en parallèle sur les mêmes créneaux, en seulement 2 étapes : Demi-finales,
+// puis Finales + Petites Finales (qui déterminent directement les 20
+// places). On reste donc sur "Demi-finales" jusqu'à ce qu'elles soient
+// toutes jouées, puis on bascule sur "Finales & Petites Finales", qui
+// alterne avec le Classement Final dès cette étape (comme pour les autres
+// tournois, le classement n'a de sens qu'une fois la phase éliminatoire
+// commencée).
+// ══════════════════════════════════════════════════════════
+function getTVSettings(){
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem('tvSettings')||'{}'); } catch(e){}
+  return {
+    mode:              saved.mode              || 'cycle', // 'results' | 'standings' | 'cycle'
+    intervalMatches:   saved.intervalMatches    || 12,       // secondes d'affichage des écrans "matchs"
+    intervalStandings: saved.intervalStandings  || 20,       // secondes d'affichage de l'écran "classement" (plus long, table à lire)
+    hidden:            saved.hidden             || false,    // barre de réglages masquée
+    scroll:            (saved.scroll===undefined) ? true : saved.scroll // défilement auto si le contenu dépasse l'écran
+  };
+}
+function saveTVSettings(patch){
+  const next = { ...getTVSettings(), ...patch };
+  try { localStorage.setItem('tvSettings', JSON.stringify(next)); } catch(e){}
+  return next;
+}
+
+function startTVCycle(){
+  stopTVCycle();
+  tvScreenIndex = 0;
+  tvLastRenderedKey = null; // on force un "vrai changement d'écran" au tout premier rendu de cette session
+  tvClockIv = setInterval(updateTVClock, 1000);
+  updateTVClock();
+  // L'avancement lui-même est (re)planifié par scheduleTVAdvance(), appelée
+  // à la fin de renderTVContent() — ainsi le délai appliqué est toujours
+  // celui de l'écran ACTUELLEMENT affiché (résultats/tours = court,
+  // classement = plus long), et chaque mise à jour live redonne un plein
+  // temps de lecture.
+}
+function stopTVCycle(){
+  if(tvCycleIv){ clearTimeout(tvCycleIv); tvCycleIv=null; }
+  if(tvClockIv){ clearInterval(tvClockIv); tvClockIv=null; }
+  stopTVAutoScroll();
+}
+// Programme la bascule vers l'écran suivant, avec une durée qui dépend du
+// type de l'écran actuellement affiché (kind 'standings' → intervalStandings,
+// sinon → intervalMatches). Ne programme rien s'il n'y a qu'un seul écran
+// disponible (rien à faire défiler).
+function scheduleTVAdvance(){
+  if(tvCycleIv){ clearTimeout(tvCycleIv); tvCycleIv=null; }
+  const screens = getActiveTVScreens();
+  if(screens.length<=1) return;
+  const current = screens[Math.min(tvScreenIndex, screens.length-1)];
+  const cfg = getTVSettings();
+  const sec = (current && current.kind==='standings')
+    ? Math.max(5, +cfg.intervalStandings || 20)
+    : Math.max(5, +cfg.intervalMatches || 12);
+  tvCycleIv = setTimeout(()=>{
+    const screens2 = getActiveTVScreens();
+    if(screens2.length>1) tvScreenIndex = (tvScreenIndex+1) % screens2.length;
+    renderTVContent(); // se charge elle-même de re-planifier via scheduleTVAdvance()
+  }, sec*1000);
+}
+function updateTVClock(){
+  const el=document.getElementById('tvClock'); if(!el) return;
+  el.textContent = new Date().toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+
+// ── Défilement automatique du contenu (mode Écran) ────────────────────────
+// Quand il y a trop de matchs/lignes pour tenir sur l'écran, on fait défiler
+// la zone de contenu vers le bas tout seul (pas de souris/clavier sur la TV),
+// avec une petite pause en haut et en bas pour laisser le temps de lire.
+// Cycle : pause sur la ligne "en cours" (2,5s) → défilement lent vers le bas
+// → pause en bas (2,5s) → retour au tout début → on recommence (pour quand
+// même montrer tous les matchs). Ne fait rien si le contenu tient déjà
+// entièrement dans l'écran.
+let tvScrollState = { phase:'pausedTop', since:0 };
+function startTVAutoScroll(){
+  stopTVAutoScroll();
+  const el = document.getElementById('tvContent'); if(!el) return;
+  const maxScrollInit = el.scrollHeight - el.clientHeight;
+
+  // Point de départ : la ligne du/des match(s) "en cours" si elle existe,
+  // sinon le tout début.
+  let startPos = 0;
+  if(maxScrollInit > 6){
+    const liveEl = el.querySelector('.tv-match-live');
+    if(liveEl){
+      const elRect = el.getBoundingClientRect();
+      const liveRect = liveEl.getBoundingClientRect();
+      const relativeTop = (liveRect.top - elRect.top) + el.scrollTop;
+      startPos = Math.max(0, Math.min(relativeTop - 16, maxScrollInit));
+    }
+  }
+  el.scrollTop = startPos;
+  tvScrollState = { phase:'pausedTop', since: Date.now() };
+  if(getTVSettings().scroll === false) return; // défilement désactivé par l'opérateur
+  const SPEED = 0.7;   // px par tick (≈23 px/s) — lent, pensé pour être lisible
+  const PAUSE_MS = 2500;
+  tvScrollIv = setInterval(()=>{
+    if(!el.isConnected) return;
+    const maxScroll = el.scrollHeight - el.clientHeight;
+    if(maxScroll <= 6) return; // tout tient déjà à l'écran
+    const now = Date.now();
+    if(tvScrollState.phase==='pausedTop'){
+      if(now - tvScrollState.since >= PAUSE_MS) tvScrollState = { phase:'scrollingDown', since: now };
+      return;
+    }
+    if(tvScrollState.phase==='pausedBottom'){
+      if(now - tvScrollState.since >= PAUSE_MS){
+        el.scrollTop = 0; // on repart du tout début pour finir par montrer l'ensemble des matchs
+        tvScrollState = { phase:'pausedTop', since: now };
+      }
+      return;
+    }
+    el.scrollTop += SPEED;
+    if(el.scrollTop >= maxScroll - 1){
+      el.scrollTop = maxScroll;
+      tvScrollState = { phase:'pausedBottom', since: now };
+    }
+  }, 30);
+}
+function stopTVAutoScroll(){
+  if(tvScrollIv){ clearInterval(tvScrollIv); tvScrollIv=null; }
+}
+
+function renderTVPage(){
+  renderTVSettingsUI();
+  renderTVContent();
+}
+function renderTVSettingsUI(){
+  const cfg = getTVSettings();
+  const bar = document.getElementById('tvControlBar');
+  if(bar) bar.style.display = cfg.hidden ? 'none' : 'flex';
+  const tab = document.getElementById('tvShowTab');
+  if(tab) tab.style.display = cfg.hidden ? 'flex' : 'none';
+  const modeSel = document.getElementById('tvModeSelect');
+  if(modeSel) modeSel.value = cfg.mode;
+  const ivmWrap = document.getElementById('tvIntervalMatchesWrap');
+  if(ivmWrap) ivmWrap.style.display = cfg.mode==='standings' ? 'none' : '';
+  const ivsWrap = document.getElementById('tvIntervalStandingsWrap');
+  if(ivsWrap) ivsWrap.style.display = cfg.mode==='results' ? 'none' : '';
+  const ivmInput = document.getElementById('tvIntervalMatchesInput');
+  if(ivmInput) ivmInput.value = cfg.intervalMatches;
+  const ivsInput = document.getElementById('tvIntervalStandingsInput');
+  if(ivsInput) ivsInput.value = cfg.intervalStandings;
+  const scrollChk = document.getElementById('tvScrollToggle');
+  if(scrollChk) scrollChk.checked = cfg.scroll;
+}
+window.tvSetMode = function(v){ saveTVSettings({ mode:v }); startTVCycle(); renderTVPage(); };
+window.tvSetIntervalMatches = function(v){ saveTVSettings({ intervalMatches: Math.max(5,+v||12) }); scheduleTVAdvance(); };
+window.tvSetIntervalStandings = function(v){ saveTVSettings({ intervalStandings: Math.max(5,+v||20) }); scheduleTVAdvance(); };
+window.tvSetScroll = function(v){ saveTVSettings({ scroll: !!v }); startTVAutoScroll(); };
+window.tvToggleHidden = function(){ saveTVSettings({ hidden: !getTVSettings().hidden }); renderTVSettingsUI(); };
+window.tvToggleFullscreen = function(){
+  if(!document.fullscreenElement) document.documentElement.requestFullscreen().catch(()=>{});
+  else document.exitFullscreen().catch(()=>{});
+};
+window.tvExit = function(){
+  stopTVCycle();
+  if(USER_ROLE==='spectator' || USER_ROLE===null) spectatorGoLive(4);
+  else goTo(4);
+};
+
+function tvMatchRowHTML(m, isLive){
+  const aName = m.aId ? tName(m.aId) : '<em>à déterminer</em>';
+  const bName = m.bId ? tName(m.bId) : '<em>à déterminer</em>';
+  const score = m.done ? `${m.r.ga} – ${m.r.gb}` : (isLive ? 'en cours' : '–');
+  return `<div class="tv-match-row ${isLive?'tv-match-live':''}">
+    <div class="tv-match-meta"><span>${m.label}${m.court?' · T'+m.court:''}</span><span class="tv-match-time">${m.time||''}</span></div>
+    <div class="tv-match-teams">
+      <span class="tv-team">${aName}</span>
+      <span class="tv-score">${score}</span>
+      <span class="tv-team tv-team-r">${bName}</span>
+    </div>
+  </div>`;
+}
+// Grille de cartes de match. isLiveFn(m) détermine si CE match doit être mis
+// en avant comme "en cours" (uniquement pertinent s'il n'est pas encore joué).
+function tvMatchGridHTML(matches, isLiveFn){
+  if(!matches.length) return `<div class="tv-empty">Aucun match à afficher pour le moment.</div>`;
+  const cards = matches.map(m=>tvMatchRowHTML(m, !m.done && isLiveFn && isLiveFn(m))).join('');
+  return `<div class="tv-match-grid">${cards}</div>`;
+}
+
+const TV_PAGE_SIZE = 12; // nombre maximum de matchs affichés sur un même écran avant pagination
+
+function tvStandingsPoolsHTML(){
+  return `<div class="tv-pools-grid">` + ['A','B','C','D'].map(p=>{
+    const st = computePoolStandings(p);
+    const col = POOL_COLORS[p];
+    return `<div class="tv-pool-card" style="border-color:${col.main}">
+      <div class="tv-pool-ttl" style="background:${col.main}">Poule ${p}</div>
+      <table class="tv-stbl">
+        <thead><tr><th>#</th><th>Équipe</th><th>Pts</th><th>J</th><th>+/-</th></tr></thead>
+        <tbody>${st.map((s,i)=>`<tr class="${i<2?'tv-row-top':''}">
+          <td>${i+1}</td><td class="tv-team-name">${tName(s.id)}</td>
+          <td class="tv-pts">${s.pts}</td><td>${s.j}</td><td>${s.diff>0?'+':''}${s.diff}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+  }).join('') + `</div>`;
+}
+function tvFinalRankingHTML(){
+  const ranking = computeFinalRanking();
+  if(!ranking.length) return `<div class="tv-empty">Le classement s'affichera une fois la phase 2 lancée.</div>`;
+  return `<table class="tv-final-tbl">
+    <thead><tr><th>Place</th><th>Équipe</th></tr></thead>
+    <tbody>${ranking.map(r=>`<tr class="${r.place<=3?'tv-podium-'+r.place:''}">
+      <td class="tv-place">${r.place===1?'🥇':r.place===2?'🥈':r.place===3?'🥉':r.place}</td>
+      <td class="tv-team-name">${tName(r.teamId)}</td>
+    </tr>`).join('')}</tbody>
+  </table>`;
+}
+
+// Libellé d'un match de Phase 2 : nom du tableau + plage de places + nom du
+// tour (ex : "T2 (places 5-8) · Demi 1").
+function tvGroupMatchLabel(m){
+  const base = BRACKET_BASE_PLACE[m.bracket];
+  const roundName = m.round==='semi1' ? 'Demi 1' : m.round==='semi2' ? 'Demi 2' : m.round==='final' ? 'Finale' : 'Petite finale';
+  return `${m.bracket} (places ${base}-${base+3}) · ${roundName}`;
+}
+
+// Construit la liste ordonnée des "écrans" disponibles.
+// Phase 1 : tous les matchs de poules (1 écran qui défile) + classement des poules.
+// Phase 2 : Demi-finales (tant qu'elles ne sont pas toutes jouées) — SEUL
+// écran à ce stade (comme pour les autres tournois, pas de classement
+// pertinent avant que la phase éliminatoire ait commencé à produire des
+// résultats). Une fois les demi-finales terminées : Finales & Petites
+// Finales, ENSEMBLE avec le Classement Final (qui se complète au fur et à
+// mesure), jusqu'à la fin du tournoi.
+function getTVScreens(){
+  const screens = [];
+  if(ST.phase==='pools'){
+    const poolMatches = (ST.poolSchedule||[]).map(m=>{
+      const r = getPoolResult(m.matchId);
+      return { slot:m.slot, court:m.court, time:m.time, label:'Poule '+m.pool, aId:m.a, bId:m.b, r, done:(r.ga!==''&&r.gb!=='') };
+    }).sort((a,b)=>a.slot-b.slot||a.court-b.court);
+    const isLiveNow = (ST.activeView==='pools' && typeof ST.activePoolRound==='number')
+      ? (m=>m.slot===ST.activePoolRound) : (()=>false);
+    screens.push({
+      key:'pool-results', kind:'matches', title:'⚽ Matchs de Poules',
+      render: ()=>tvMatchGridHTML(poolMatches, isLiveNow)
+    });
+    screens.push({ key:'pool-std', kind:'standings', title:'📊 Classement des Poules', render: tvStandingsPoolsHTML });
+    return screens;
+  }
+
+  // Phase 2 (groups) ou terminé : plus aucun mélange avec les poules.
+  const buildFlat = (rounds) => (ST.groupSchedule||[])
+    .filter(m=>rounds.includes(m.round))
+    .sort((a,b)=>a.slot-b.slot||a.court-b.court)
+    .map(m=>{
+      const t = getBracketMatchTeams(m);
+      const r = getGroupResult(m.matchId);
+      return { slot:m.slot, court:m.court, time:m.time, label:tvGroupMatchLabel(m), aId:t.a, bId:t.b, r, done:(r.ga!==''&&r.gb!=='') };
+    });
+  const isLiveNow = m=>m.slot===ST.activeGroupRound;
+
+  const semis = (ST.groupSchedule||[]).filter(m=>m.round==='semi1'||m.round==='semi2');
+  const semisDone = semis.length>0 && semis.every(m=>{ const r=getGroupResult(m.matchId); return r.ga!==''&&r.gb!==''; });
+
+  if(!semisDone){
+    const flat = buildFlat(['semi1','semi2']);
+    const pageCount = Math.max(1, Math.ceil(flat.length/TV_PAGE_SIZE));
+    for(let i=0;i<pageCount;i++){
+      const page = flat.slice(i*TV_PAGE_SIZE,(i+1)*TV_PAGE_SIZE);
+      screens.push({
+        key:'demi-'+i, kind:'matches',
+        title: pageCount>1 ? `🏆 Demi-finales (${i+1}/${pageCount})` : '🏆 Demi-finales',
+        render: ()=>tvMatchGridHTML(page, isLiveNow)
+      });
+    }
+  } else {
+    const flat = buildFlat(['final','petite']);
+    const pageCount = Math.max(1, Math.ceil(flat.length/TV_PAGE_SIZE));
+    for(let i=0;i<pageCount;i++){
+      const page = flat.slice(i*TV_PAGE_SIZE,(i+1)*TV_PAGE_SIZE);
+      screens.push({
+        key:'finale-'+i, kind:'matches',
+        title: pageCount>1 ? `🏆 Finales & Petites Finales (${i+1}/${pageCount})` : '🏆 Finales & Petites Finales',
+        render: ()=>tvMatchGridHTML(page, isLiveNow)
+      });
+    }
+    screens.push({ key:'final-rank', kind:'standings', title:'🥇 Classement Final', render: tvFinalRankingHTML });
+  }
+  return screens;
+}
+// Applique le filtre du réglage "Affichage" (Résultats / Classement / Alterné)
+// à la liste d'écrans de la phase en cours. La progression entre étapes
+// (Demi-finales → Finales, poules → phase 2) est déjà gérée dans
+// getTVScreens() lui-même.
+function getActiveTVScreens(){
+  const screens = getTVScreens();
+  const cfg = getTVSettings();
+  if(cfg.mode==='results')   return screens.filter(s=>s.kind==='matches');
+  if(cfg.mode==='standings') return screens.filter(s=>s.kind==='standings');
+  return screens; // 'cycle' = tout, dans l'ordre construit ci-dessus
+}
+
+function renderTVContent(){
+  const el=document.getElementById('tvContent'); if(!el) return;
+  const phaseEl=document.getElementById('tvPhaseBadge');
+  if(phaseEl) phaseEl.textContent = ST.phase==='pools' ? '🏊 Phase 1 (Poules)' : ST.phase==='groups' ? '🏆 Phase 2 (Tableaux)' : '🏁 Tournoi terminé';
+
+  // Changement de phase (ex : poules → phase 2) : on repart du 1er écran
+  // plutôt que de garder un index qui ne correspondrait plus à rien.
+  if(ST.phase !== tvLastPhase){ tvLastPhase = ST.phase; tvScreenIndex = 0; }
+
+  const screens = getActiveTVScreens();
+  const sig = screens.map(s=>s.key).join('|');
+  if(sig !== tvLastScreensSig){ tvLastScreensSig = sig; tvScreenIndex = 0; } // ex: demi-finales terminées → on bascule sur les finales dès le 1er rendu
+  if(tvScreenIndex >= screens.length) tvScreenIndex = 0;
+  const screen = screens[tvScreenIndex];
+  const subEl=document.getElementById('tvSubTitle');
+
+  // Un vrai changement d'écran justifie de repartir du début (position de
+  // défilement + minuteur de bascule). Une simple actualisation de données
+  // en direct sur LE MÊME écran (ex : un score rentre pendant qu'on regarde
+  // le classement) ne doit PAS tout réinitialiser — sinon l'écran
+  // Classement, plus long à lire, ne finit jamais de défiler si des scores
+  // rentrent régulièrement pendant ce temps-là.
+  const isScreenChange = !screen || screen.key !== tvLastRenderedKey;
+  tvLastRenderedKey = screen ? screen.key : null;
+
+  if(!screen){
+    if(subEl) subEl.textContent = '';
+    el.innerHTML = `<div class="tv-empty">Rien à afficher pour le moment.</div>`;
+  } else {
+    if(subEl) subEl.textContent = screen.title;
+    el.innerHTML = screen.render();
+  }
+  if(!isScreenChange) return; // données actualisées en place, on laisse le défilement/minuteur en cours suivre leur cours
+  // requestAnimationFrame : on attend que la mise en page du nouveau contenu
+  // soit posée avant de calculer la position de la ligne "en cours" (sinon,
+  // sur un changement d'écran, la mesure peut être prise un cran trop tôt).
+  requestAnimationFrame(startTVAutoScroll);
+  scheduleTVAdvance(); // (re)programme la prochaine bascule avec la durée propre à cet écran
 }
 
 // ── Carte de match (saisie score) ────────────────────────
@@ -2470,6 +2855,68 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
 .ovx{ overflow-x:auto;-webkit-overflow-scrolling:touch; }
 @keyframes blink{ 0%,100%{opacity:1}50%{opacity:.4} }
 
+/* ── MODE ÉCRAN (diffusion sur écran externe) ─────────────────────────── */
+body.tv-mode .hdr,
+body.tv-mode .spec-nav,
+body.tv-mode .steps,
+body.tv-mode .hdr-drawer,
+body.tv-mode .hdr-drawer-overlay{ display:none!important; }
+
+#pageTV{ position:fixed; inset:0; z-index:200; background:radial-gradient(ellipse at top,#0f2a18 0%,#081a10 55%,#04100a 100%); color:#fff; display:none; flex-direction:column; overflow:hidden; }
+#pageTV.active{ display:flex; }
+
+.tv-hdr{ display:flex; align-items:center; gap:18px; padding:clamp(10px,2vh,22px) clamp(16px,3vw,40px); border-bottom:2px solid rgba(255,255,255,.12); flex-wrap:wrap; flex-shrink:0; }
+.tv-brand{ font-family:'Oswald',sans-serif; font-weight:700; letter-spacing:1px; font-size:clamp(18px,2.4vw,30px); }
+.tv-phase-badge{ background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.25); border-radius:30px; padding:6px 16px; font-size:clamp(12px,1.3vw,16px); font-family:'Oswald',sans-serif; letter-spacing:.6px; }
+.tv-clock{ margin-left:auto; font-family:'Oswald',sans-serif; font-size:clamp(20px,2.6vw,34px); font-weight:700; font-variant-numeric:tabular-nums; color:#7affa0; }
+
+.tv-sub-ttl{ text-align:center; font-family:'Oswald',sans-serif; font-size:clamp(20px,3vw,40px); letter-spacing:1px; color:#ffd27a; padding:clamp(10px,2vh,18px) 0 4px; flex-shrink:0; }
+
+.tv-body{ flex:1; padding:0 clamp(16px,4vw,60px) 90px; overflow-y:auto; scrollbar-width:none; }
+.tv-body::-webkit-scrollbar{ width:0; height:0; }
+
+.tv-section-ttl{ font-family:'Oswald',sans-serif; font-size:clamp(14px,1.6vw,20px); letter-spacing:2px; color:rgba(255,255,255,.55); margin:18px 0 10px; text-transform:uppercase; }
+.tv-live-ttl{ color:#ff6b5e; display:flex; align-items:center; gap:10px; }
+.tv-live-dot{ width:14px; height:14px; border-radius:50%; background:#ff3b30; display:inline-block; animation:blink 1s ease-in-out infinite; }
+
+.tv-match-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:12px; margin-bottom:8px; }
+.tv-match-row{ background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.14); border-radius:14px; padding:14px 18px; }
+.tv-match-row.tv-match-live{ border-color:#ff6b5e; background:rgba(255,80,60,.12); box-shadow:0 0 0 1px rgba(255,80,60,.4); }
+.tv-match-meta{ font-size:clamp(11px,1.1vw,14px); color:rgba(255,255,255,.6); margin-bottom:6px; display:flex; justify-content:space-between; gap:8px; }
+.tv-match-time{ color:#7ab8ff; font-weight:700; }
+.tv-match-teams{ display:flex; align-items:center; gap:10px; }
+.tv-team{ flex:1; font-family:'Oswald',sans-serif; font-weight:700; font-size:clamp(15px,1.8vw,22px); }
+.tv-team-r{ text-align:right; }
+.tv-score{ font-family:'Oswald',sans-serif; font-weight:700; font-size:clamp(18px,2.4vw,30px); color:#ffd27a; white-space:nowrap; padding:0 6px; }
+
+.tv-empty{ text-align:center; color:rgba(255,255,255,.5); padding:30px; font-size:clamp(14px,1.6vw,18px); }
+
+.tv-pools-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); gap:16px; }
+.tv-pool-card{ background:rgba(255,255,255,.05); border:2px solid; border-radius:14px; overflow:hidden; }
+.tv-pool-ttl{ font-family:'Oswald',sans-serif; font-weight:700; font-size:clamp(15px,1.6vw,20px); padding:8px 14px; }
+.tv-stbl{ width:100%; border-collapse:collapse; font-size:clamp(12px,1.3vw,17px); }
+.tv-stbl th{ color:rgba(255,255,255,.5); text-transform:uppercase; font-size:clamp(9px,.9vw,11px); padding:6px 10px; text-align:center; }
+.tv-stbl th:nth-child(2){ text-align:left; }
+.tv-stbl td{ padding:7px 10px; text-align:center; border-top:1px solid rgba(255,255,255,.08); }
+.tv-stbl .tv-team-name{ text-align:left; font-weight:600; }
+.tv-row-top td{ background:rgba(122,255,160,.08); }
+.tv-pts{ font-weight:700; color:#7affa0; }
+
+.tv-final-tbl{ width:100%; max-width:760px; margin:0 auto; border-collapse:collapse; font-size:clamp(14px,1.8vw,22px); }
+.tv-final-tbl th{ padding:10px; color:rgba(255,255,255,.5); text-transform:uppercase; font-size:clamp(10px,1.1vw,13px); }
+.tv-final-tbl td{ padding:10px 14px; border-top:1px solid rgba(255,255,255,.1); }
+.tv-place{ font-weight:700; text-align:center; width:80px; }
+.tv-podium-1 td{ background:rgba(255,215,80,.14); } .tv-podium-2 td{ background:rgba(200,210,230,.10); } .tv-podium-3 td{ background:rgba(210,140,80,.12); }
+
+.tv-bar{ position:fixed; left:0; right:0; bottom:0; z-index:210; background:rgba(0,0,0,.78); backdrop-filter:blur(6px); display:flex; align-items:center; gap:14px; padding:10px 18px; flex-wrap:wrap; border-top:1px solid rgba(255,255,255,.15); }
+.tv-bar label{ color:rgba(255,255,255,.65); font-size:12px; display:flex; align-items:center; gap:6px; text-transform:none; letter-spacing:0; font-weight:400; }
+.tv-bar select, .tv-bar input{ background:rgba(255,255,255,.1); color:#fff; border:1px solid rgba(255,255,255,.3); border-radius:6px; padding:6px 10px; font-size:13px; }
+.tv-bar select option{ background:#0f2a18; color:#fff; }
+.tv-bar button{ padding:7px 14px; border-radius:8px; border:1px solid rgba(255,255,255,.3); background:rgba(255,255,255,.08); color:#fff; font-family:'Oswald',sans-serif; font-size:13px; cursor:pointer; letter-spacing:.4px; }
+.tv-bar button:hover{ background:rgba(255,255,255,.2); }
+.tv-show-tab{ position:fixed; right:14px; bottom:14px; z-index:210; width:42px; height:42px; border-radius:50%; background:rgba(0,0,0,.6); border:1px solid rgba(255,255,255,.3); color:#fff; align-items:center; justify-content:center; cursor:pointer; font-size:17px; display:none; }
+@keyframes blink{ 0%,100%{opacity:1}50%{opacity:.4} }
+
 @media print{
   body{ background:#fff!important;color:#000!important;font-size:11px; }
   .hdr,.steps,.rtabs,.btn,.hdr-btn,button{ display:none!important; }
@@ -2502,12 +2949,15 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
           🏆 CLASSEMENT
         </button>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-        <button onclick="enterLiveModeAndGo('T')" style="padding:13px 8px;background:rgba(255,255,255,.10);border:1.5px solid rgba(255,200,150,.3);border-radius:10px;color:#ffdcb8;font-family:'Oswald',sans-serif;font-size:15px;letter-spacing:.6px;cursor:pointer;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:6px">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+        <button onclick="enterLiveModeAndGo('T')" style="padding:13px 6px;background:rgba(255,255,255,.10);border:1.5px solid rgba(255,200,150,.3);border-radius:10px;color:#ffdcb8;font-family:'Oswald',sans-serif;font-size:14px;letter-spacing:.4px;cursor:pointer;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:5px">
           👥 ÉQUIPES
         </button>
-        <button onclick="enterLiveModeAndGo('R')" style="padding:13px 8px;background:rgba(255,255,255,.10);border:1.5px solid rgba(255,200,150,.3);border-radius:10px;color:#ffdcb8;font-family:'Oswald',sans-serif;font-size:15px;letter-spacing:.6px;cursor:pointer;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:6px">
+        <button onclick="enterLiveModeAndGo('R')" style="padding:13px 6px;background:rgba(255,255,255,.10);border:1.5px solid rgba(255,200,150,.3);border-radius:10px;color:#ffdcb8;font-family:'Oswald',sans-serif;font-size:14px;letter-spacing:.4px;cursor:pointer;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:5px">
           📋 RÈGLEMENT
+        </button>
+        <button onclick="enterLiveModeAndGo('TV')" style="padding:13px 6px;background:rgba(255,255,255,.10);border:1.5px solid rgba(255,200,150,.3);border-radius:10px;color:#ffdcb8;font-family:'Oswald',sans-serif;font-size:14px;letter-spacing:.4px;cursor:pointer;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:5px">
+          📺 ÉCRAN
         </button>
       </div>
     </div>
@@ -2558,6 +3008,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
   <div class="hdr-r" id="hdrDesktopBtns">
     <button class="hdr-btn" id="ruleBtn" onclick="toggleRules()">📋 Règlement</button>
     <button class="hdr-btn" id="liveBtn" data-role="scorer" onclick="goToLive()" style="display:none">📺 Live</button>
+    <button class="hdr-btn" id="tvBtn" data-role="scorer" onclick="goTo('TV')" style="display:none">📺 Écran</button>
     <button class="hdr-btn" id="adminBtn" data-role="admin" onclick="toggleAdminPanel()" style="display:none">👑 Admin</button>
     <button class="hdr-btn" id="managerBtn" data-role="manager" onclick="goTo('M')" style="display:none">🛡️ Mon équipe</button>
     <button class="hdr-btn" id="backBtn" style="display:none" onclick="goBack()">← Retour</button>
@@ -2571,6 +3022,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
 <nav class="hdr-drawer" id="mobileDrawer">
   <button class="hdr-drawer-btn" id="drawerRuleBtn" onclick="toggleRules();closeMobileMenu()">📋 Règlement</button>
   <button class="hdr-drawer-btn" id="drawerLiveBtn" data-role="scorer" onclick="goToLive()" style="display:none">📺 Live</button>
+  <button class="hdr-drawer-btn" id="drawerTvBtn" data-role="scorer" onclick="goTo('TV');closeMobileMenu()" style="display:none">📺 Écran</button>
   <button class="hdr-drawer-btn" id="drawerAdminBtn" data-role="admin" onclick="toggleAdminPanel();closeMobileMenu()" style="display:none">👑 Admin</button>
   <button class="hdr-drawer-btn" id="drawerManagerBtn" data-role="manager" onclick="goTo('M');closeMobileMenu()" style="display:none">🛡️ Mon équipe</button>
   <div class="hdr-drawer-sep"></div>
@@ -2585,6 +3037,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
   <div class="admin-panel-ttl">👑 Panneau Admin</div>
   <div class="flex g8 fw">
     <button class="btn btn-g btn-sm" id="liveToggleBtn" onclick="toggleLiveOpen()">🔴 Live fermé (spectateurs)</button>
+    <button class="btn btn-b btn-sm" onclick="toggleAdminPanel();goTo('TV')">📺 Mode Écran (affichage)</button>
     <button class="btn btn-b btn-sm" onclick="toggleUsersPanel()">👥 Gérer le staff</button>
     <button class="btn btn-b btn-sm" onclick="toggleAdminPanel();goTo('M')">📋 Feuilles d'équipe</button>
     <button class="btn btn-y btn-sm" onclick="resetAllResults()">🔄 Réinitialiser tous les scores</button>
@@ -2633,6 +3086,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
   </button>
   <button class="spec-nav-btn" data-target="5" onclick="spectatorGoLive(5)">🏆 Classement</button>
   <button class="spec-nav-btn" onclick="spectatorGoLive('T')">👥 Équipes</button>
+  <button class="spec-nav-btn" data-target="TV" onclick="spectatorGoLive('TV')">📺 Écran</button>
   <button class="spec-nav-btn" onclick="toggleRules()">📋 Règlement</button>
   <button class="spec-nav-btn" onclick="logout()" style="margin-left:auto;color:var(--red)">🔑 Connexion Staff</button>
 </nav>
@@ -2863,7 +3317,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
     <div class="card" style="margin-top:18px">
       <div class="card-ttl">
         <span>📊 Classements des poules (en direct)</span>
-        <button class="btn btn-b btn-xs" data-role="admin" onclick="buildGroups()">2️⃣ Composer les tableaux (Phase 2)</button>
+        <button class="btn btn-b btn-xs" id="buildGroupsBtn" data-role="admin" onclick="buildGroups()">2️⃣ Composer les tableaux (Phase 2)</button>
       </div>
       <div id="poolStandingsPanel"></div>
     </div>
@@ -3032,6 +3486,37 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
     <p>Le Comité d'Organisation du tournoi est seul habilité à régler tout litige. Aucune réclamation ne sera acceptée après la fin du tournoi.</p>
   </div>
 </div>
+</div>
+
+<!-- ══ PAGE ÉCRAN — DIFFUSION SUR ÉCRAN EXTERNE ══ -->
+<div class="page" id="pageTV">
+  <div class="tv-hdr">
+    <div class="tv-brand">⚽ Vétérans UST</div>
+    <div class="tv-phase-badge" id="tvPhaseBadge">—</div>
+    <div class="tv-clock" id="tvClock">--:--:--</div>
+  </div>
+  <div class="tv-sub-ttl" id="tvSubTitle">⚽ Résultats en direct</div>
+  <div class="tv-body" id="tvContent"></div>
+
+  <!-- Barre de réglages : pour la personne qui installe l'écran. Peut être masquée une fois réglée. -->
+  <div class="tv-bar" id="tvControlBar">
+    <button onclick="tvExit()">← Retour</button>
+    <label>Affichage
+      <select id="tvModeSelect" onchange="tvSetMode(this.value)">
+        <option value="results">Résultats</option>
+        <option value="standings">Classement</option>
+        <option value="cycle">Alterné (les deux)</option>
+      </select>
+    </label>
+    <label id="tvIntervalMatchesWrap">⚽ Résultats : <input type="number" id="tvIntervalMatchesInput" min="5" max="120" value="12" style="width:55px"
+      onchange="tvSetIntervalMatches(this.value)"> sec</label>
+    <label id="tvIntervalStandingsWrap">🏆 Classement : <input type="number" id="tvIntervalStandingsInput" min="5" max="180" value="20" style="width:55px"
+      onchange="tvSetIntervalStandings(this.value)"> sec</label>
+    <label><input type="checkbox" id="tvScrollToggle" checked onchange="tvSetScroll(this.checked)"> 🔃 Défilement auto</label>
+    <button onclick="tvToggleFullscreen()">⛶ Plein écran</button>
+    <button onclick="tvToggleHidden()">🙈 Masquer la barre</button>
+  </div>
+  <div class="tv-show-tab" id="tvShowTab" onclick="tvToggleHidden()" title="Afficher les réglages">⚙</div>
 </div>
 
 </div><!-- /appScreen -->
