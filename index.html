@@ -280,6 +280,7 @@ async function ensureUserDoc(user){
 
 onAuthStateChanged(auth, async (user)=>{
   if(USER_ROLE === 'spectator' && !user) return;
+  closeAdminPanel(); // toute connexion / déconnexion referme le panneau admin
   if(user){
     CURRENT_USER = user;
     await ensureUserDoc(user);
@@ -317,7 +318,7 @@ onAuthStateChanged(auth, async (user)=>{
       const snap = await getDoc(doc(db,'foottournoi20','status'));
       if(snap.exists()){
         const d = snap.data();
-        ST.liveOpen = d.liveOpen === true;
+        handleLiveOpenChange(d.liveOpen === true);
         handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft); applyTimersFromStatus(d);
       }
     } catch(e){}
@@ -344,6 +345,7 @@ window.loginGoogle = async function(){
   catch(e){ showAuthMsg(authErrMsg(e.code),'red'); }
 };
 window.logout = async function(){
+  closeAdminPanel();
   clearInterval(ST.timerIv); unsubAll();
   USER_ROLE = null; CURRENT_USER = null;
   if(auth.currentUser) await signOut(auth);
@@ -366,13 +368,147 @@ function showAuthMsg(msg,color){
   el.textContent=msg; el.style.color = color==='red' ? 'var(--red)' : 'var(--grn)';
 }
 
-window.enterLiveModeAndGo = function(target){
+let pendingSpecTarget = null; // cible demandée par un visiteur en attente que le live s'ouvre
+
+// ── CHARGEMENT DES DONNÉES ────────────────────────────────────────────────
+// Tant que le 1er snapshot de foottournoi20/current n'est pas arrivé, ST est vide
+// et les écrans affichaient « non programmé ». On affiche un écran de chargement.
+let DATA_READY = false, dataLoadTO = null, resubTO = null, resubTries = 0;
+function hideDataLoader(){
+  clearTimeout(dataLoadTO);
+  const el = document.getElementById('dataLoader');
+  if(el) el.style.display = 'none';
+}
+function setDataReady(ok){
+  DATA_READY = ok;
+  if(ok){ hideDataLoader(); return; }
+  const el = document.getElementById('dataLoader');
+  const app = document.getElementById('appScreen');
+  if(!el || !app || app.style.display === 'none') return;
+  el.style.display = 'flex';
+  const slow = el.querySelector('.dl-slow'); if(slow) slow.style.display = 'none';
+  clearTimeout(dataLoadTO);
+  dataLoadTO = setTimeout(()=>{
+    if(DATA_READY) return;
+    const sl = el.querySelector('.dl-slow'); if(sl) sl.style.display = '';
+  }, 8000);
+}
+window.retryDataLoad = function(){ resubTries = 0; subscribeToTournament(); };
+
+// Lit l'état du live dans foottournoi20/status (toujours lisible publiquement) ;
+// repli sur current si status n'existe pas encore.
+async function refreshLiveStatus(){
+  try {
+    const snap = await getDoc(doc(db,'foottournoi20','status'));
+    if(snap.exists()){ handleLiveOpenChange(snap.data().liveOpen === true); return; }
+  } catch(e){ console.warn('refreshLiveStatus(status)', e); }
+  try {
+    const snap = await getDoc(doc(db,'foottournoi20','current'));
+    if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
+  } catch(e){ /* current illisible quand le live est fermé : normal */ }
+}
+// Au retour d'arrière-plan (mobile), relecture immédiate de l'état du live.
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible' && !_bgDetached) refreshLiveStatus();
+});
+
+// Remplace entièrement la map des résultats (un setDoc merge ne supprime jamais de clés).
+async function replaceResults(map){
+  if(!isScorer()) return;
+  try {
+    await setDoc(doc(db,'foottournoi20','current'), { results: map, updatedAt: serverTimestamp() }, { mergeFields:['results','updatedAt'] });
+  } catch(e){ console.error('replaceResults', e); alert('Erreur de sauvegarde : '+e.message); }
+}
+
+// ── PANNEAU ADMIN : fermeture automatique ─────────────────────────────────
+let STAFF_CREATING = false; // true pendant la création d'un compte staff (bascule temporaire d'utilisateur Auth)
+let adminIdleTO = null;
+const ADMIN_IDLE_MS = 5*60*1000; // 5 min sans action → le panneau se referme
+function closeAdminPanel(){
+  if(STAFF_CREATING) return;
+  const pn = document.getElementById('adminPanel');
+  if(pn) pn.classList.remove('open');
+  ['registrationsPanel','refereesPanel','teamRefPanel','usersPanel'].forEach(id=>{
+    const e=document.getElementById(id); if(e) e.style.display='none';
+  });
+  ['registrationsList','usersList','refereesPanelBody','teamRefPanelBody'].forEach(id=>{
+    const e=document.getElementById(id); if(e) e.innerHTML='';
+  });
+  ['newStaffName','newStaffEmail','newStaffPwd','adminPwdConfirm'].forEach(id=>{
+    const e=document.getElementById(id); if(e) e.value='';
+  });
+  const m=document.getElementById('newStaffMsg'); if(m) m.textContent='';
+  clearTimeout(adminIdleTO);
+}
+function armAdminIdle(){
+  clearTimeout(adminIdleTO);
+  const pn = document.getElementById('adminPanel');
+  if(pn && pn.classList.contains('open')) adminIdleTO = setTimeout(closeAdminPanel, ADMIN_IDLE_MS);
+}
+['pointerdown','keydown','touchstart'].forEach(ev=>document.addEventListener(ev, armAdminIdle, { passive:true }));
+
+function resetSessionUI(){
+  if(STAFF_CREATING) return;
+  closeAdminPanel();
+  try{ closeMobileMenu(); }catch(e){}
+  try{ stopTVCycle(); }catch(e){}
+  ST.rulesOpen = false;
+  const rb = document.getElementById('ruleBtn'); if(rb) rb.textContent = '📋 Règlement';
+  document.body.classList.remove('tv-mode');
+  document.querySelectorAll('.page').forEach(pg=>pg.classList.remove('active'));
+  const pw = document.getElementById('li_pwd'); if(pw) pw.value = '';
+}
+
+// ── SUIVI DU LIVE ─────────────────────────────────────────────────────────
+// Appelée à chaque nouvelle valeur de liveOpen (status, current, relecture).
+function handleLiveOpenChange(nowOpen){
+  const wasOpen = ST.liveOpen;
+  ST.liveOpen = nowOpen;
+  updateLiveToggleBtn();
+
+  // Fermeture : un spectateur déjà dans l'app est renvoyé sur l'overlay « live fermé ».
+  if(wasOpen && !ST.liveOpen){
+    const appScreen = document.getElementById('appScreen');
+    const isInApp = appScreen && appScreen.style.display !== 'none';
+    if(isInApp && (USER_ROLE === 'spectator' || USER_ROLE === null)){
+      const overlay = document.getElementById('liveClosedOverlay');
+      if(overlay) overlay.style.display = 'flex';
+      pendingSpecTarget = typeof ST.page === 'number' ? ST.page : 4;
+    }
+    return;
+  }
+
+  // Ouverture : s'assurer que les données arrivent (écoute morte ou absente).
+  if(!wasOpen && ST.liveOpen && USER_ROLE === 'spectator' && !unsubTournament){
+    subscribeToTournament();
+  }
+
+  // Ouverture : débloquer un visiteur/spectateur en attente.
+  if(!wasOpen && ST.liveOpen && pendingSpecTarget !== null){
+    const overlay = document.getElementById('liveClosedOverlay');
+    if(overlay) overlay.style.display = 'none';
+    const target = pendingSpecTarget;
+    pendingSpecTarget = null;
+    if(USER_ROLE === 'spectator'){
+      if(target === 'R') toggleRules();
+      else goTo(target);
+    } else {
+      enterLiveModeAndGo(target);
+    }
+  }
+}
+
+window.enterLiveModeAndGo = async function(target){
+  await refreshLiveStatus(); // relecture fraîche : le listener peut avoir du retard sur mobile
   if(target !== 'R' && !ST.liveOpen){
+    pendingSpecTarget = target;
     const overlay = document.getElementById('liveClosedOverlay');
     if(overlay) overlay.style.display='flex';
     return;
   }
+  pendingSpecTarget = null;
   USER_ROLE = 'spectator';
+  closeAdminPanel();
   document.getElementById('loginScreen').style.display = 'none';
   document.getElementById('appScreen').style.display = '';
   const specNav = document.getElementById('specNav');
@@ -380,6 +516,9 @@ window.enterLiveModeAndGo = function(target){
   const stepNav = document.getElementById('stepNav');
   if(stepNav) stepNav.style.display = 'none';
   applyRoleUI();
+  // Visiteur sans compte : il faut S'ABONNER aux données du tournoi (avant, seul
+  // le flux des messages était démarré → aucune donnée, écran « non programmé »).
+  if(!CURRENT_USER){ subscribeToTournament(); subscribeToMessages(); }
   if(target === 'R'){ toggleRules(); }
   else if(target === 'T'){ goTo('T'); }
   else { goTo(target); }
@@ -422,7 +561,14 @@ document.addEventListener('visibilitychange', ()=>{
 // PERSISTANCE FIRESTORE — doc unique 'foottournoi/current'
 // ══════════════════════════════════════════════════════════
 function subscribeToTournament(){
+  if(!unsubLiveWatch || !liveWatchIv) startLiveWatch();
+  // Jamais deux listeners en parallèle (avant : chaque appel en ajoutait un).
+  if(unsubTournament){ unsubTournament(); unsubTournament=null; }
+  clearTimeout(resubTO);
+  setDataReady(false);
   unsubTournament = onSnapshot(doc(db,'foottournoi20','current'), (snap)=>{
+    resubTries = 0;
+    setDataReady(true); // même si le document n'existe pas encore
     if(!snap.exists()) return;
     const data=snap.data();
     if(data.cfg)             ST.cfg             = data.cfg;
@@ -442,11 +588,26 @@ function subscribeToTournament(){
     ST.refereeAssignments = sanitizeRefereeAssignments(data.refereeAssignments);
     ST.teamRefereeAssignments = sanitizeTeamRefereeAssignments(data.teamRefereeAssignments);
     ST.clubOverrides = sanitizeClubOverrides(data.clubOverrides);
-    ST.liveOpen = data.liveOpen === true;
     ST.registrationsOpen = data.registrationsOpen === true;
-    updateLiveToggleBtn();
     updateRegOpenBtn();
+    handleLiveOpenChange(data.liveOpen === true);
     refreshCurrentPage();
+  }, (e)=>{
+    console.warn('subscribeToTournament', e);
+    // Un listener Firestore en erreur est définitivement arrêté (ex. permission-denied
+    // quand l'admin ferme le live) : on le libère pour pouvoir le recréer.
+    unsubTournament = null;
+    if(!USER_ROLE) return;
+    if(e && e.code === 'permission-denied' && USER_ROLE === 'spectator' && !ST.liveOpen){
+      hideDataLoader(); // live fermé : handleLiveOpenChange réabonnera à la réouverture
+      return;
+    }
+    if(resubTries < 5){
+      resubTO = setTimeout(subscribeToTournament, Math.min(15000, 2000*(++resubTries)));
+    } else {
+      const el = document.getElementById('dataLoader');
+      if(el){ el.style.display='flex'; const sl=el.querySelector('.dl-slow'); if(sl) sl.style.display=''; }
+    }
   });
 }
 let unsubMessages = null, TV_MESSAGES = [];
@@ -791,7 +952,8 @@ window.buildGroupSchedule = function(){
   ST.groupBreaks = insertedBreaks;
   ST.results = Object.fromEntries(Object.entries(ST.results).filter(([k])=>!k.startsWith('group-'))); // reset résultats des tableaux seulement
   ST.phase='groups';
-  saveTournament({ groupSchedule: finalSchedule, groupTabSlot: ST.groupTabSlot, groupTabSlot2: ST.groupTabSlot2, groupBreaks: insertedBreaks, results: ST.results, phase:'groups' });
+  saveTournament({ groupSchedule: finalSchedule, groupTabSlot: ST.groupTabSlot, groupTabSlot2: ST.groupTabSlot2, groupBreaks: insertedBreaks, phase:'groups' });
+  replaceResults(ST.results); // setDoc(merge) ne supprime pas les anciens scores des tableaux : on remplace la map
   ST.activeView='groups'; ST.activeGroupRound=0;
   renderTournamentPage();
 };
@@ -815,7 +977,7 @@ window.setPhaseResult = async function(resultPrefix, matchId, ga, gb){
   const current = ST.results[key] || {};
   const results = { ...ST.results, [key]: { ...current, ga, gb } };
   ST.results = results;
-  await saveTournament({ results });
+  await saveTournament({ results: { [key]: results[key] } }); // uniquement CE match (évite d'écraser les autres scorers)
 };
 window.setPhaseShootout = async function(resultPrefix, matchId, shootout){
   if(!isScorer()) return;
@@ -823,7 +985,7 @@ window.setPhaseShootout = async function(resultPrefix, matchId, shootout){
   const current = ST.results[key] || {};
   const results = { ...ST.results, [key]: { ...current, shootout } };
   ST.results = results;
-  await saveTournament({ results });
+  await saveTournament({ results: { [key]: results[key] } });
 };
 // Rétro-compatibilité (code existant utilisant getPoolResult/setPoolResult/setPoolShootout)
 function getPoolResult(matchId){ return getPhaseResult('pool', matchId); }
@@ -1090,6 +1252,8 @@ window.newTournament = async function(){
 // NAVIGATION & RÔLES
 // ══════════════════════════════════════════════════════════
 window.showLogin = function showLogin(){
+  resetSessionUI();
+  hideDataLoader();
   document.getElementById('loginScreen').style.display='flex';
   document.getElementById('appScreen').style.display='none';
   const regScreen = document.getElementById('registrantScreen');
@@ -1102,7 +1266,13 @@ function showApp(){
   const regScreen = document.getElementById('registrantScreen');
   if(regScreen) regScreen.style.display='none';
   applyRoleUI();
+  closeAdminPanel();
+  if(STAFF_CREATING) return; // bascule temporaire pendant la création d'un compte
+  // Page d'arrivée choisie TOUJOURS selon le rôle (avant : la page restée active de
+  // la session précédente, ex. Config/Planning de l'admin, restait visible).
   if(USER_ROLE === 'manager') goTo('M');
+  else if(isAdmin()) goTo([1,2,3,4,5].includes(ST.page) ? ST.page : 1);
+  else goTo(4);
 }
 function roleBadge(role){
   const map={admin:'👑 Admin',scorer:'✏️ Scorer (saisie scores)',manager:'🛡️ Responsable équipe',spectator:'👁 Spectateur'};
@@ -1184,6 +1354,8 @@ window.goFwd = function(){
 };
 
 window.goTo = function(n){
+  if((n===1 || n===2 || n===3) && !isAdmin()) n = 4; // pages de programmation : admin uniquement
+  closeAdminPanel(); // tout changement de page referme le panneau admin
   if(n!=='R' && isLiveBlocked()){
     const overlay = document.getElementById('liveClosedOverlay');
     if(overlay) overlay.style.display='flex';
@@ -1232,8 +1404,10 @@ window.goTo = function(n){
   if(n===4) renderTournamentPage();
   if(n===5) renderFinalPage();
 };
-window.spectatorGoLive = function(n){
+window.spectatorGoLive = async function(n){
+  await refreshLiveStatus(); // relecture fraîche de l'état du live au moment du tap
   if(n!=='R' && isLiveBlocked()){
+    pendingSpecTarget = n;
     const overlay = document.getElementById('liveClosedOverlay');
     if(overlay) overlay.style.display='flex';
     return;
@@ -1248,6 +1422,7 @@ function updateSteps(n){
 }
 
 window.toggleRules = function(){
+  closeAdminPanel();
   ST.rulesOpen=!ST.rulesOpen;
   if(!ST.rulesOpen && isLiveBlocked()){
     document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
@@ -1266,14 +1441,17 @@ window.toggleRules = function(){
 };
 
 window.toggleAdminPanel = function(){
+  if(!isAdmin()) return;
   const p=document.getElementById('adminPanel');
-  if(p) p.classList.toggle('open');
+  if(!p) return;
+  if(p.classList.contains('open')) closeAdminPanel();
+  else { p.classList.add('open'); armAdminIdle(); }
 };
 window.toggleLiveOpen = async function(){
   if(!isAdmin()) return;
-  ST.liveOpen = !ST.liveOpen;
-  await saveTournament({ liveOpen: ST.liveOpen });
-  updateLiveToggleBtn();
+  const newVal = !ST.liveOpen;
+  handleLiveOpenChange(newVal); // mise à jour immédiate côté admin
+  await saveTournament({ liveOpen: newVal });
 };
 function updateLiveToggleBtn(){
   const btn=document.getElementById('liveToggleBtn');
@@ -1346,8 +1524,7 @@ function startLiveWatch(){
   unsubLiveWatch = onSnapshot(doc(db,'foottournoi20','status'), (snap)=>{
     if(!snap.exists()) return;
     const d = snap.data();
-    ST.liveOpen = d.liveOpen === true;
-    updateLiveToggleBtn();
+    handleLiveOpenChange(d.liveOpen === true);
     handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft); applyTimersFromStatus(d);
   }, (e)=>{ console.warn('startLiveWatch', e); });
   if(!liveWatchIv){
@@ -1357,8 +1534,7 @@ function startLiveWatch(){
         const snap = await getDoc(doc(db,'foottournoi20','status'));
         if(snap.exists()){
           const d = snap.data();
-          ST.liveOpen = d.liveOpen === true;
-          updateLiveToggleBtn();
+          handleLiveOpenChange(d.liveOpen === true);
           handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft); applyTimersFromStatus(d);
         }
       } catch(e){ /* silencieux : réseau indisponible */ }
@@ -2324,6 +2500,7 @@ window.createStaffAccount = async function(){
   if(!adminEmail){ setMsg('Reconnectez-vous en admin (email/mot de passe) avant de créer un compte staff.','red'); return; }
 
   setMsg('Création en cours…','grn');
+  STAFF_CREATING = true;
   try {
     // 1. Crée le compte Auth (connecte automatiquement ce nouveau compte)
     const cred = await createUserWithEmailAndPassword(auth, email, pwd);
@@ -2354,6 +2531,8 @@ window.createStaffAccount = async function(){
     if(auth.currentUser && auth.currentUser.email !== adminEmail){
       setMsg('Compte staff créé, mais la reconnexion admin a échoué (mot de passe admin incorrect ?). Reconnectez-vous manuellement.','red');
     }
+  } finally {
+    setTimeout(()=>{ STAFF_CREATING = false; }, 4000);
   }
 };
 
@@ -4536,6 +4715,13 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
 </div>
 
 <!-- ══ OVERLAY LIVE FERMÉ ══ -->
+<div id="dataLoader" style="display:none;position:fixed;inset:0;z-index:400;background:rgba(238,243,252,.96);align-items:center;justify-content:center;flex-direction:column;gap:14px;padding:24px;text-align:center;font-family:'Oswald',sans-serif">
+  <div style="font-size:42px">⚽</div>
+  <div style="font-size:20px;letter-spacing:1px;color:#0f4a1f">Chargement du tournoi…</div>
+  <div class="dl-slow" style="display:none;font-family:'Exo 2',sans-serif;font-size:13px;color:#555">
+    Connexion lente. <button onclick="retryDataLoad()" style="margin-left:6px;padding:8px 16px;background:#1a7a3a;color:#fff;border:none;border-radius:8px;cursor:pointer;font-family:'Oswald',sans-serif;font-size:14px">🔄 Réessayer</button>
+  </div>
+</div>
 <div id="liveClosedOverlay" style="display:none;position:fixed;inset:0;z-index:500;background:rgba(200,255,220,.9);backdrop-filter:blur(6px);align-items:center;justify-content:center;padding:24px">
   <div style="background:#fff;border-radius:16px;padding:30px;max-width:380px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.3)">
     <div style="font-size:48px;margin-bottom:10px">⏰</div>
