@@ -254,8 +254,14 @@ function watchOwnRole(uid, rawRole){
     }, ()=>{});
   } catch(e){ console.warn('watchOwnRole', e); }
 }
-async function getUserProfile(uid){
+// Seul admin « permanent » : toujours admin, quoi qu'il y ait dans sa fiche (filet de sécurité ; DOIT rester identique
+// à isAdmin() dans les règles Firestore). Tous les autres comptes suivent le rôle attribué dans « Gérer le staff ».
+const HARDCODED_ADMIN_EMAILS = ['bracket.organizer@gmail.com'];
+async function getUserProfile(uid, email){
   RAW_DOC_ROLE = null;
+  if(email && HARDCODED_ADMIN_EMAILS.includes(email)){
+    return { role:'admin', teamId:null };
+  }
   try {
     const snap = await getDoc(doc(db,'users',uid));
     if(snap.exists()){
@@ -295,7 +301,7 @@ async function ensureUserDoc(user){
       await setDoc(ref,{
         email: user.email,
         name:  user.displayName || user.email.split('@')[0],
-        role:  'spectator',
+        role:  HARDCODED_ADMIN_EMAILS.includes(user.email) ? 'admin' : 'spectator',
         createdAt: serverTimestamp()
       });
     }
@@ -310,7 +316,7 @@ onAuthStateChanged(auth, async (user)=>{
   if(user){
     CURRENT_USER = user;
     await ensureUserDoc(user);
-    const profile = await getUserProfile(user.uid);
+    const profile = await getUserProfile(user.uid, user.email);
     USER_ROLE = profile.role;
     MANAGER_TEAM_ID = profile.teamId;
     MANAGER_EXTRA_TEAM_IDS = profile.extraTeamIds || [];
